@@ -6,29 +6,50 @@
 import math
 
 from imutils.video import VideoStream
+from imutils import contours
 import argparse
 import datetime
 import imutils
 import time
 import cv2
 import numpy as np
+from skimage import measure
 
 # TODO: Add a counter and only return moving objects if they have been seen a few times
 
 
 VIDEO_SIZE = 800
-STALE_THRESHOLD = 6
+STALE_THRESHOLD = 20
+
+def region_of_interest(image):
+    height = image.shape[0]
+    width = image.shape[1]
+
+    polygons = np.array([[(0, 207), (width, 20), (width, height), (0, height)]])
+    mask = np.zeros_like(image)
+    cv2.fillPoly(mask, polygons, 255)
+    masked_image = cv2.bitwise_and(image,mask)
+    return masked_image
+
+
+def scale_contour(cnt, scale):
+    M = cv2.moments(cnt)
+    cx = int(M['m10']/M['m00'])
+    cy = int(M['m01']/M['m00'])
+
+    cnt_norm = cnt - [cx, cy]
+    cnt_scaled = cnt_norm * scale
+    cnt_scaled = cnt_scaled + [cx, cy]
+    cnt_scaled = cnt_scaled.astype(np.int32)
+
+    return cnt_scaled
 
 class TrackObjectsUsingContours:
     def __init__(self):
         self.objects = []
-        self.ball = None
+        self.count = 0
 
     def add(self, contour):
-        if self.ball:
-            if self.ball.is_this_me(contour):
-                self.ball.recalibrate_position(contour)
-            return
         # if ball not found, then search for ball
         for moving_object in self.objects:
             if moving_object.is_this_me(contour):
@@ -36,7 +57,8 @@ class TrackObjectsUsingContours:
                 return  # is this right? I've found myself, but could also be 1) another object
 
         # didn't find a match, add as a new object
-        self.objects.append(MovingObject(contour=contour))
+        self.count += 1
+        self.objects.append(MovingObject(contour=contour, id = self.count))
 
     def how_many_objects(self):
         return len(self.objects)
@@ -53,8 +75,6 @@ class TrackObjectsUsingContours:
         return self.objects
 
     def find_ball(self):
-        if self.ball:
-            return
         potential_balls = self.most_traveled_objects()
         if potential_balls:
             if potential_balls[0].distance > 300:
@@ -63,26 +83,63 @@ class TrackObjectsUsingContours:
                 self.ball = None
 
     def cleanup_stale_objects(self):
+        # remove object after N number of frames
         self.objects = [obj for obj in self.objects if obj.stale < STALE_THRESHOLD]
 
 
 
 class MovingObject:
 
-    def __init__(self, contour):
+    def __init__(self, contour, id):
+        self.id = id
         self.contour = contour
         self.speed = 0
         self.distance = 0
 
         self.stale = 0
 
-    def is_this_me(self, contour):
-        found = self.contourIntersect(self.contour, contour)
+    @property
+    def area(self):
+        return cv2.contourArea(self.contour)
+
+    @property
+    def perimeter(self):
+        return cv2.arcLength(self.contour, True)
+
+    def is_this_me(self, new_contour):
+        old_contour = self.contour
+        overlap = self.contourIntersect(old_contour, new_contour)
+        matching_shape = cv2.matchShapes(old_contour, new_contour, 1, 0.0) < 0.5
+        similar_area_perimeter = self.is_similar_enough_in_area_perimeter(new_contour)
+        found = overlap and matching_shape and similar_area_perimeter
         if not found:
             self.stale += 1
+            print("ID {}: overlap: {}, shape: {}, similar_area: {}".format(self.id, overlap, matching_shape, similar_area_perimeter))
         else:
             self.stale = 0
         return found
+
+    def is_similar_enough_in_area_perimeter(self, new_contour):
+        BUFFER = 1 # area or perimeter can be +/-
+        new_area = cv2.contourArea(new_contour)
+        new_perimeter = cv2.arcLength(self.contour, True)
+
+        area_similar = MovingObject.within_bounds(new_area, self.area, BUFFER)
+        perimeter_similar = MovingObject.within_bounds(new_perimeter, self.perimeter, BUFFER)
+
+        return area_similar and perimeter_similar
+
+
+    @staticmethod
+    def calculate_lower_upper_bounds(number, buffer):
+        lower = number * ( 1 - buffer)
+        upper = number * ( 1 + buffer)
+        return lower, upper
+
+    @staticmethod
+    def within_bounds(new_number, old_number, buffer):
+        lower_bound, upper_bound = MovingObject.calculate_lower_upper_bounds(old_number, buffer)
+        return (new_number >= lower_bound) and (new_number <= upper_bound)
 
     def recalibrate_position(self, contour):
         prev_contour = self.contour
@@ -98,6 +155,9 @@ class MovingObject:
 
     def contourIntersect(self,contour1, contour2):
         # Two separate contours trying to check intersection on
+        SCALE = 3 # increase size of intersection
+        contour1 = scale_contour(contour1, SCALE)
+        contour2 = scale_contour(contour2, SCALE)
         contours = [contour1, contour2]
 
         # Create image filled with zeros the same size of original image
@@ -148,8 +208,8 @@ trackbars = np.zeros((300, 512, 3), np.uint8)
 cv2.namedWindow('trackbars')
 
 # create trackbars for color change
-cv2.createTrackbar('Threshold', 'trackbars', 20, 255, nothing)
-cv2.createTrackbar('Iterations', 'trackbars', 20, 255, nothing)
+cv2.createTrackbar('Threshold', 'trackbars', 25, 255, nothing)
+cv2.createTrackbar('Iterations', 'trackbars', 16, 255, nothing)
 cv2.createTrackbar('min_size', 'trackbars', 50, 1000, nothing)
 cv2.createTrackbar('max_size', 'trackbars', 1000, 1000, nothing)
 
@@ -177,6 +237,7 @@ while True:
     # resize the frame, convert it to grayscale, and blur it
     frame = imutils.resize(frame, width=VIDEO_SIZE)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = region_of_interest(gray)
     gaussian_blur = 3
     gray = cv2.GaussianBlur(gray, (gaussian_blur, gaussian_blur), 0)
 
@@ -193,21 +254,51 @@ while True:
 
     # dilate the thresholded image to fill in holes, then find contours
     # on thresholded image
-    thresh = cv2.dilate(thresh, None, iterations=iterations)
+    dilatation_type = cv2.MORPH_ELLIPSE
+    element = cv2.getStructuringElement(dilatation_type, (2 * iterations + 1, 2 * iterations + 1),
+                                       (iterations, iterations))
+    thresh = cv2.dilate(thresh, element)
+    thresh = cv2.erode(thresh, None, iterations=3)
     cnts = cv2.findContours(thresh.copy(),
                             cv2.RETR_EXTERNAL,
                             cv2.CHAIN_APPROX_SIMPLE)
     cnts = imutils.grab_contours(cnts)
+    # cnts = contours.sort_contours(cnts)[0]
+
 
     # TODO: ADD UI drag elements to tweak all these settings on the fly
 
+    # perform a connected component analysis on the thresholded
+    # image, then initialize a mask to store only the "large"
+    # components
+    # labels = measure.label(thresh, neighbors=8, background=0)
+    # mask = np.zeros(thresh.shape, dtype="uint8")
+    # # loop over the unique components
+    # for label in np.unique(labels):
+    #     # if this is the background label, ignore it
+    #     if label == 0:
+    #         continue
+    #     # otherwise, construct the label mask and count the
+    #     # number of pixels
+    #     labelMask = np.zeros(thresh.shape, dtype="uint8")
+    #     labelMask[labels == label] = 255
+    #     numPixels = cv2.countNonZero(labelMask)
+    #     # if the number of pixels in the component is sufficiently
+    #     # large, then add it to our mask of "large blobs"
+    #     if numPixels > 300:
+    #         mask = cv2.add(mask, labelMask)
+    #
+    # cv2.imshow("mask", mask)
+
+
     # loop over the contours
-    for c in cnts:
+    for idx, c in enumerate(cnts):
         # if the contour is too small, ignore it
         # if cv2.contourArea(c) > max_size or cv2.contourArea(c) < min_size:
         #     continue
 
         object_tracker.add(c)
+        contours.label_contour(frameDelta, c, idx)
 
         # # compute the bounding box for the contour, draw it on the frame,
         # # and update the text
@@ -224,15 +315,31 @@ while True:
         #     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
         #     text = "Ball not found"
 
+        # TODO: use different properties of contours to isolate ball
 
-        # (x, y, w, h) = cv2.boundingRect(c)
+        (x, y, w, h) = cv2.boundingRect(c)
+        moment = cv2.moments(c)
+        area = cv2.contourArea(c)
+        perimeter = cv2.arcLength(c, True)
+        hull = str(cv2.convexHull(c, returnPoints=True))
+        convex = cv2.isContourConvex(c)
+        ratio = cv2.contourArea(c) / cv2.arcLength(c, True)
+        # print(idx, area, perimeter, ratio, len(hull))
+        # if (ratio < 5.5 or ratio > 8.7) or (area > 1100):
+        #     continue
         # cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        # cv2.putText(frame, str(idx) + " " + str(ratio) + " " + str(area), (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
 
-    # for obj in object_tracker.fastest_objects():
-    #     (x, y, w, h) = cv2.boundingRect(obj.contour)
-    #     speed = obj.speed
-    #     cv2.putText(frame, str(speed),(x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 125, 125), 1)
-    #     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 125, 125), 2)
+        (x, y), radius = cv2.minEnclosingCircle(c)
+        center = (int(x), int(y))
+        radius = int(radius)
+        img = cv2.circle(frame, center, radius, (0, 255, 0), 1)
+
+    for obj in object_tracker.objects:
+        (x, y, w, h) = cv2.boundingRect(obj.contour)
+        speed = obj.speed
+        cv2.putText(frame, str(obj.id) + "  " + str(obj.distance),(x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 125, 125), 1)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 125, 125), 2)
     #
     # for obj in object_tracker.most_traveled_objects():
     #     (x, y, w, h) = cv2.boundingRect(obj.contour)
@@ -240,17 +347,50 @@ while True:
     #     cv2.putText(frame, str(distance),(x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
     #     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 1)
 
-    ball = object_tracker.ball
-    if ball is not None:
-        (x, y, w, h) = cv2.boundingRect(ball.contour)
-        cv2.putText(frame, "ball", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 125, 125), 1)
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 125, 125), 2)
+    # ball = object_tracker.ball
+    # if ball is not None:
+    #     (x, y, w, h) = cv2.boundingRect(ball.contour)
+    #     cv2.putText(frame, "ball", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 125, 125), 1)
+    #     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 125, 125), 2)
 
     # draw the text and timestamp on the frame
     cv2.putText(frame, "Room Status: {}".format(text), (10, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
     cv2.putText(frame, datetime.datetime.now().strftime("%A %d %B %Y %I:%M:%S%p"),
                 (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+
+    # # Setup SimpleBlobDetector parameters.
+    # params = cv2.SimpleBlobDetector_Params()
+    #
+    # # Change thresholds
+    # params.minThreshold = 10
+    # params.maxThreshold = 20
+    #
+    # # Filter by Area.
+    # params.filterByArea = True
+    # params.minArea = 0
+    # params.maxArea = 100
+    #
+    # # Filter by Circularity
+    # params.filterByCircularity = True
+    # params.minCircularity = 0.87
+    #
+    # # Filter by Convexity
+    # params.filterByConvexity = True
+    # params.minConvexity = 0.2
+    #
+    # # Filter by Inertia
+    # params.filterByInertia = True
+    # params.minInertiaRatio = 0.5
+    #
+    # detector = cv2.SimpleBlobDetector_create(params)
+    # keypoints = detector.detect(gray)
+    # print(keypoints)
+
+    # img_key_points = cv2.drawKeypoints(gray, keypoints, np.array([]), (0,0,255), cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    #
+    # cv2.imshow("KEYPOINTS", img_key_points)
+    # cv2.moveWindow("KEYPOINTS", 1500, 800)
 
     # show the frame and record if the user presses a key
 
@@ -278,5 +418,4 @@ while True:
 # cleanup the camera and close any open windows
 vs.stop() if args.get("video", None) is None else vs.release()
 cv2.destroyAllWindows()
-
 
