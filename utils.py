@@ -65,7 +65,7 @@ def find_all_contours(image):
     return cnts
 
 
-class TrackObjectsUsingContours:
+class ObjectTracker:
     def __init__(self):
         self.objects = []
         self.count = 0
