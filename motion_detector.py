@@ -96,6 +96,7 @@ class MovingObject:
         self.speed = 0
         self.distance = 0
 
+        self.age = 0
         self.stale = 0
 
     @property
@@ -116,6 +117,8 @@ class MovingObject:
             self.stale += 1
             print("ID {}: overlap: {}, shape: {}, similar_area: {}".format(self.id, overlap, matching_shape, similar_area_perimeter))
         else:
+            # if found, increment age
+            self.age += 1
             self.stale = 0
         return found
 
@@ -336,8 +339,9 @@ while True:
         img = cv2.circle(frame, center, radius, (0, 255, 0), 1)
 
     for obj in object_tracker.objects:
+        if obj.age < 100:
+            continue
         (x, y, w, h) = cv2.boundingRect(obj.contour)
-        speed = obj.speed
         cv2.putText(frame, str(obj.id) + "  " + str(obj.distance),(x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 125, 125), 1)
         cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 125, 125), 2)
     #
