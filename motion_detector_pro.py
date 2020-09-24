@@ -11,9 +11,10 @@ import imutils
 import time
 import cv2
 import numpy as np
+from statemachine import StateMachine, State
 
 from utils import ObjectTracker, region_of_interest, VIDEO_SIZE, compute_difference_with_dilation_erosion, \
-    find_all_contours
+     find_contours_around_ball
 
 # Tweak these when ball found, or when search for ball
 STARTING_THRESHOLD = 25
@@ -25,6 +26,30 @@ ap.add_argument("-v", "--video", help="path to the video file")
 ap.add_argument("-a", "--min-area", type=int, default=500, help="minimum area size")
 args = vars(ap.parse_args())
 
+
+class BallMachine(StateMachine):
+    text = "Searching"
+
+    # States
+    searching = State('Searching', initial=True)
+    tracking = State('Track')
+    scanning = State('Scanning') # find recently lost ball
+
+    # Transitions
+    ball_lost = scanning.to(searching)
+
+    found = searching.to(tracking) | scanning.to(tracking)
+    not_found = searching.to(searching) | tracking.to(scanning)
+
+    def on_enter_searching(self):
+        self.text = "Searching"
+
+    def on_enter_tracking(self):
+        self.text = "Tracking"
+
+    def on_enter_scanning(self):
+        self.text = "Scanning"
+
 # if the video argument is None, then we are reading from webcam
 if args.get("video", None) is None:
     vs = VideoStream(src=0).start()
@@ -34,28 +59,25 @@ if args.get("video", None) is None:
 else:
     vs = cv2.VideoCapture(args["video"])
 
-# initialize the first frame in the video stream
+# initialize the lastFrame
 lastFrame = None
-
-
-###############track bars ##########
-
-trackbars = np.zeros((300, 512, 3), np.uint8)
-cv2.namedWindow('Tennis')
 
 def nothing(x):
     pass
 
+
+trackbars = np.zeros((300, 512, 3), np.uint8)
+cv2.namedWindow('Tennis')
 cv2.createTrackbar('Threshold', 'Tennis', STARTING_THRESHOLD, 255, nothing)
 cv2.createTrackbar('Iterations', 'Tennis', STARTING_INTERATIONS, 255, nothing)
 
 object_tracker = ObjectTracker()
-ball_found = False
+
+bstm = BallMachine()
 
 while True:
     frame = vs.read()
     frame = frame if args.get("video", None) is None else frame[1]
-    text = "Not Found"
 
     # if the frame could not be grabbed, then we have reached the end
     if frame is None:
@@ -80,23 +102,33 @@ while True:
     iterations = cv2.getTrackbarPos('Iterations', 'Tennis')
     thresh = compute_difference_with_dilation_erosion(currentFrame=gray, lastFrame=lastFrame, threshold=threshold, iterations=iterations)
 
-    cnts = find_all_contours(thresh)
+    cnts = None
 
-    # loop over the contours
-    for idx, c in enumerate(cnts):
+    if bstm.is_searching:
+        object_tracker.search_for_ball(where=thresh, frame=frame)
+    elif bstm.is_scanning:
+        object_tracker.search_for_missing_ball(thresh, frame)
+    elif bstm.is_tracking:
+        cnts = find_contours_around_ball(object_tracker.ball, thresh)
+        object_tracker.track_found_ball_per_frame(cnts)
 
-        object_tracker.add(c)
-        contours.label_contour(frame, c, idx) # so much better than the circles
+    for obj in object_tracker.objects:
+        c = obj.contour
+        (x, y), radius = cv2.minEnclosingCircle(c)
+        center = (int(x), int(y))
+        radius = int(radius)
+        img = cv2.circle(frame, center, radius, (0, 255, 255), 1)
+        cv2.putText(frame, str(obj.id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-        (x, y, w, h) = cv2.boundingRect(c)
-        moment = cv2.moments(c)
-        area = cv2.contourArea(c)
-        perimeter = cv2.arcLength(c, True)
-        hull = str(cv2.convexHull(c, returnPoints=True))
-        convex = cv2.isContourConvex(c)
-        ratio = cv2.contourArea(c) / cv2.arcLength(c, True)
+    if object_tracker.ball:
+        c = object_tracker.ball.contour
+        (x, y), radius = cv2.minEnclosingCircle(c)
+        center = (int(x), int(y))
+        radius = int(radius)
+        img = cv2.circle(frame, center, radius, (0, 0, 255), -1)
+        cv2.putText(frame, "ball", (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 0)
 
-    cv2.putText(frame, "Ball Status: {}".format(text), (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    cv2.putText(frame, "Ball Status: {}".format(bstm.text), (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
     cv2.putText(frame, datetime.datetime.now().strftime("%A %d %B %Y %I:%M:%S%p"), (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
 
     cv2.imshow("Gray", gray)
@@ -114,8 +146,10 @@ while True:
         break
 
     lastFrame = gray
-    object_tracker.cleanup_stale_objects()
-    object_tracker.find_ball()
+    if not bstm.is_tracking:
+        object_tracker.make_unmatched_contours_objects()
+        object_tracker.try_find_ball_from_objects(bstm)
+
 
 # cleanup the camera and close any open windows
 vs.stop() if args.get("video", None) is None else vs.release()
